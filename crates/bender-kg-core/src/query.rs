@@ -15,6 +15,11 @@ impl Engine {
     pub fn get_module(&self, name: &str) -> Result<Option<ModuleData>> {
         Ok(self.store.get_module(name)?)
     }
+    /// Run a raw READ-ONLY openCypher query (escape hatch). Write clauses
+    /// are rejected and the result is row-capped in the store layer.
+    pub fn run_cypher(&self, query: &str, row_cap: usize) -> Result<serde_json::Value> {
+        Ok(self.store.run_readonly_cypher(query, row_cap)?)
+    }
     pub fn get_subgraph(&self, name: &str, depth: i32) -> Result<Subgraph> {
         Ok(self.store.get_subgraph(name, depth)?)
     }

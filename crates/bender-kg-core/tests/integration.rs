@@ -136,9 +136,9 @@ async fn build_extracts_modules_and_hierarchy_from_pickle_fixture() {
         "leaf should have core as a parent, got {parent_names:?}"
     );
 
-    // Vector search by exact name should surface the module itself.
+    // Hybrid search by exact name should surface the module itself.
     let hits = engine
-        .search_modules("top", 5, None)
+        .search_modules("top", 5, None, None)
         .await
         .expect("search_modules");
     assert!(

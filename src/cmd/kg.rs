@@ -245,8 +245,13 @@ pub enum OutputFormat {
 pub enum QueryOp {
     SearchModules {
         query: String,
+        /// Max hits to return. `0` = unbounded (every hit above --min-score),
+        /// for "find all X" enumeration.
         #[arg(long, default_value_t = 15)]
         top_k: usize,
+        /// Drop hits whose fused RRF score is below this threshold.
+        #[arg(long)]
+        min_score: Option<f32>,
         #[arg(long)]
         design: Option<String>,
     },
@@ -326,6 +331,28 @@ pub enum QueryOp {
         min_overlap: f64,
         #[arg(long)]
         design: Option<String>,
+    },
+    /// Run a raw READ-ONLY openCypher query (last-resort escape hatch; the
+    /// dedicated ops above are the primary interface). Write clauses
+    /// (CREATE/DELETE/SET/MERGE/REMOVE/DROP/DETACH/CALL) are rejected and
+    /// results are row-capped.
+    ///
+    /// Schema:
+    ///   Nodes:  Module {name, design, file_path, is_package},
+    ///           Design {alias}, Port {name, direction, type_str, bit_width}
+    ///   Edges:  (Module)-[:INSTANTIATES {instance_name}]->(Module),
+    ///           (Module)-[:IMPORTS]->(Module),
+    ///           (Module)-[:BELONGS_TO]->(Design),
+    ///           (Module)-[:HAS_PORT]->(Port)
+    ///
+    /// Example:
+    ///   cypher "MATCH (m:Module)-[:HAS_PORT]->(p:Port) \
+    ///           WHERE p.direction='input' RETURN m.name, count(p)"
+    Cypher {
+        query: String,
+        /// Maximum rows before returning a typed "too broad" error.
+        #[arg(long, default_value_t = 1000)]
+        row_cap: usize,
     },
 }
 
@@ -583,9 +610,14 @@ fn dispatch_query(
     op: &QueryOp,
 ) -> Result<serde_json::Value> {
     let v = match op {
-        QueryOp::SearchModules { query, top_k, design } => {
+        QueryOp::SearchModules { query, top_k, min_score, design } => {
             let hits = rt
-                .block_on(engine.search_modules(query, *top_k, design.as_deref().filter(|s| !s.is_empty())))
+                .block_on(engine.search_modules(
+                    query,
+                    *top_k,
+                    *min_score,
+                    design.as_deref().filter(|s| !s.is_empty()),
+                ))
                 .into_diagnostic()?;
             serde_json::to_value(hits).into_diagnostic()?
         }
@@ -673,6 +705,9 @@ fn dispatch_query(
                 .into_diagnostic()?;
             serde_json::json!({"module": module_name, "candidates": res})
         }
+        QueryOp::Cypher { query, row_cap } => {
+            engine.run_cypher(query, *row_cap).into_diagnostic()?
+        }
     };
     Ok(v)
 }
@@ -731,6 +766,12 @@ fn format_tree(value: &serde_json::Value, op: &QueryOp) -> Option<String> {
         QueryOp::TraceSignal { .. } => render_trace_signal(&mut out, value),
         QueryOp::CheckConnectivity { .. } => render_check_connectivity(&mut out, value),
         QueryOp::MatchInterfaces { .. } => render_match_interfaces(&mut out, value),
+        // Raw Cypher rows have no fixed shape; pretty-print the JSON.
+        QueryOp::Cypher { .. } => {
+            return Some(
+                serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string()),
+            );
+        }
     }
     Some(out)
 }
@@ -1037,6 +1078,17 @@ fn render_snippet(out: &mut String, value: &serde_json::Value) {
         }
     } else if let Some(err) = value.get("error").and_then(|v| v.as_str()) {
         let _ = writeln!(out, "{err}");
+    } else if let Some(elements) = value.get("elements").and_then(|v| v.as_object()) {
+        // `--element all`: one section per sub-element.
+        for (name, el) in elements {
+            let _ = writeln!(out, "=== {name} ===");
+            render_snippet(out, el);
+        }
+    } else if let Some(snippet) = value.get("snippet").and_then(|v| v.as_str()) {
+        out.push_str(snippet);
+        if !snippet.ends_with('\n') {
+            out.push('\n');
+        }
     } else {
         let _ = writeln!(out, "(no snippet)");
     }
@@ -1741,6 +1793,7 @@ avsbus_controller → axi_lite_to_apb (u_axi_lite_to_apb) [rtl/avsbus_controller
         let op = QueryOp::SearchModules {
             query: "axi".into(),
             top_k: 5,
+            min_score: None,
             design: None,
         };
         let out = format_tree(&value, &op).unwrap();

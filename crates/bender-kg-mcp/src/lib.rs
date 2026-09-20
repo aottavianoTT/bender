@@ -209,7 +209,7 @@ impl BenderKg {
     ) -> Result<String, McpError> {
         let hits = self
             .engine
-            .search_modules(&p.query, p.top_k, opt(&p.design))
+            .search_modules(&p.query, p.top_k, None, opt(&p.design))
             .await
             .map_err(internal)?;
         as_json(&hits)
@@ -222,7 +222,7 @@ impl BenderKg {
     ) -> Result<String, McpError> {
         let hits = self
             .engine
-            .search_modules_batch(&p.queries, p.top_k, opt(&p.design))
+            .search_modules_batch(&p.queries, p.top_k, None, opt(&p.design))
             .await
             .map_err(internal)?;
         as_json(&hits)

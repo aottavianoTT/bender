@@ -129,6 +129,22 @@ impl Engine {
     pub async fn open(cfg: CoreConfig) -> Result<Self> {
         std::fs::create_dir_all(&cfg.root)?;
         let embedder = build_embedder(&cfg.embed)?;
+        // Surface which embedder actually loaded so a silent fallback to the
+        // crude deterministic `HashEmbedder` (e.g. model2vec model missing
+        // offline) is detectable rather than quietly degrading search quality.
+        let model = embedder.model();
+        if model.starts_with("hash-fallback@") {
+            log::warn!(
+                "kg.embedder using degraded hash fallback ({}, dim {}); \
+                 semantic search quality will be poor — the '{}' model2vec \
+                 model failed to load",
+                model,
+                embedder.dim(),
+                cfg.embed.model
+            );
+        } else {
+            log::info!("kg.embedder {} (dim {})", model, embedder.dim());
+        }
         let store = Store::open(&cfg.store_config(embedder.dim()))?;
         Ok(Self {
             cfg,

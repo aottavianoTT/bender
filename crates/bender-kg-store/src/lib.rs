@@ -174,6 +174,13 @@ impl Store {
         std::fs::create_dir_all(&cfg.root)?;
         let path = cfg.db_path();
         let db = GrafeoDB::open(&path)?;
+        // Property index on the compound `key` used by every MERGE/MATCH in
+        // the upsert path (`Module {key}`, `Port {key}`). Without it those
+        // lookups fall back to a full label scan, making upsert O(N^2) in
+        // node count — tolerable for ~1.7k modules but catastrophic once
+        // ports (20x as many) became first-class nodes. The index is
+        // label-agnostic (keyed on the value) so it serves both labels.
+        db.create_property_index("key");
         // Ensure schema (idempotent). Both indexes auto-maintain on
         // subsequent `set_node_property` / Cypher SET writes.
         if let Some(dim) = cfg.embedding_dim {
@@ -191,6 +198,11 @@ impl Store {
         }
         // BM25 inverted index for `find_by_protocol`. No-op if already present.
         db.create_text_index("Module", "ports_json")?;
+        // BM25 index over the broad `searchable_text` field (name + params +
+        // port names/types + description). Powers the keyword arm of the
+        // hybrid `search_modules` path so exact/substring identifier hits are
+        // never buried under a semantic neighbour. No-op if already present.
+        db.create_text_index("Module", "searchable_text")?;
         Ok(Self {
             db,
             db_path: path,
@@ -267,6 +279,11 @@ impl Store {
         create_instantiates_batch(&session, &modules, chunk)?;
         create_imports_batch(&session, &modules, chunk)?;
         create_belongs_to_batch(&session, &modules, chunk)?;
+
+        // Pass 3: promote ports to first-class nodes + wire HAS_PORT edges
+        // (additive; the `ports_json` blob on the Module node is kept for
+        // back-compat).
+        merge_port_nodes_batch(&session, &modules, chunk)?;
         session.commit()?;
         Ok(modules.len())
     }
@@ -350,8 +367,14 @@ impl Store {
     }
 
     pub fn clear_design(&self, alias: &str) -> Result<()> {
-        // Drop every Module owned by this design (with edges), then the
-        // Design node itself. Parameterised DETACH DELETE handles both.
+        // Drop every Module and Port owned by this design (with edges),
+        // then the Design node itself. Parameterised DETACH DELETE handles
+        // edges. Ports carry `design` too, so the same filter applies;
+        // clearing them prevents orphan/duplicate Port nodes on rebuild.
+        self.db.execute_cypher_with_params(
+            "MATCH (p:Port) WHERE p.design = $a DETACH DELETE p",
+            cparam("a", alias),
+        )?;
         self.db.execute_cypher_with_params(
             "MATCH (m:Module) WHERE m.design = $a DETACH DELETE m",
             cparam("a", alias),
@@ -364,6 +387,7 @@ impl Store {
     }
 
     pub fn clear_all(&self) -> Result<()> {
+        self.db.execute_cypher("MATCH (p:Port) DETACH DELETE p")?;
         self.db.execute_cypher("MATCH (m:Module) DETACH DELETE m")?;
         self.db.execute_cypher("MATCH (d:Design) DETACH DELETE d")?;
         Ok(())
@@ -611,10 +635,12 @@ impl Store {
         Ok(out)
     }
 
-    /// Find modules whose `ports_json` mentions the protocol keyword.
-    /// Grafeo's planner pushes `CONTAINS` into the `:Module(ports_json)`
-    /// inverted index when the BM25 token matches; otherwise it falls
-    /// back to a property scan with the same correctness semantics.
+    /// Find modules with a port whose resolved type mentions the protocol
+    /// keyword, via the first-class `HAS_PORT` node path:
+    /// `(m:Module)-[:HAS_PORT]->(p:Port) WHERE p.type_str CONTAINS $kw`.
+    /// This matches only the typed port `type_str`, so a keyword appearing
+    /// elsewhere in the old `ports_json` blob no longer produces a false
+    /// positive — the typed re-confirmation is now inherent to the query.
     pub fn find_by_protocol(
         &self,
         protocol: &str,
@@ -622,25 +648,20 @@ impl Store {
     ) -> Result<Vec<ModuleData>> {
         let kw = protocol.to_lowercase();
         let cypher = if design.is_some() {
-            "MATCH (m:Module) \
-             WHERE m.design = $d AND lower(m.ports_json) CONTAINS $kw \
-             RETURN m.name"
+            "MATCH (m:Module)-[:HAS_PORT]->(p:Port) \
+             WHERE m.design = $d AND lower(p.type_str) CONTAINS $kw \
+             RETURN DISTINCT m.name"
         } else {
-            "MATCH (m:Module) WHERE lower(m.ports_json) CONTAINS $kw RETURN m.name"
+            "MATCH (m:Module)-[:HAS_PORT]->(p:Port) \
+             WHERE lower(p.type_str) CONTAINS $kw \
+             RETURN DISTINCT m.name"
         };
         let r = self.db.execute_cypher_with_params(cypher, cparam_d("kw", kw.clone(), design))?;
         let mut out = Vec::new();
         for row in r.rows() {
             let n = as_string(&row[0]);
-            // Re-confirm the match against the typed PortInfo to drop
-            // false positives where the token appears outside type_str.
             if let Some(m) = self.get_module(&n)? {
-                if m.ports
-                    .iter()
-                    .any(|p| p.type_str.to_lowercase().contains(&kw))
-                {
-                    out.push(m);
-                }
+                out.push(m);
             }
         }
         Ok(out)
@@ -894,6 +915,148 @@ impl Store {
         Ok(out)
     }
 
+    /// Hybrid BM25 + HNSW search over `Module` nodes, fused with RRF.
+    ///
+    /// The keyword arm (BM25 over `searchable_text`) guarantees that an
+    /// exact or substring identifier match ranks reliably even when the
+    /// vector arm (`embedding`) would otherwise bury it under a semantic
+    /// neighbour — the grep-precision property. Grafeo's `hybrid_search`
+    /// does the fusion; we only hydrate + apply the optional design filter
+    /// and score threshold here.
+    ///
+    /// `top_k == 0` means "unbounded" (every hit above `min_score`), used
+    /// for enumeration queries. `min_score` drops hits whose fused RRF
+    /// score is below the threshold (`None` = keep all). The returned score
+    /// is the RRF fused score, not a cosine similarity.
+    pub fn search_modules_hybrid(
+        &self,
+        query_text: &str,
+        query_vector: &[f32],
+        top_k: usize,
+        min_score: Option<f32>,
+        design: Option<&str>,
+    ) -> Result<Vec<VectorHit>> {
+        // Grafeo's hybrid_search takes no design filter, so we filter
+        // post-hoc. `top_k == 0` (unbounded) maps to a large bound that
+        // dwarfs any pruned bender design while staying clear of the
+        // internal `k * 2` doubling overflow. When a design filter IS set
+        // and `top_k` is bounded, over-fetch so the filter doesn't starve
+        // the result below the requested count (a hit from another design
+        // must not consume a `top_k` slot).
+        const UNBOUNDED: usize = 100_000;
+        const DESIGN_OVERFETCH: usize = 10;
+        let k = if top_k == 0 {
+            UNBOUNDED
+        } else if design.is_some() {
+            top_k.saturating_mul(DESIGN_OVERFETCH).min(UNBOUNDED)
+        } else {
+            top_k
+        };
+        let hits = self.db.hybrid_search(
+            "Module",
+            "searchable_text",
+            "embedding",
+            query_text,
+            Some(query_vector),
+            k,
+            None, // RRF default
+        )?;
+        let mut out = Vec::with_capacity(hits.len());
+        for (node_id, score) in hits {
+            // Stop once we've collected the requested count (bounded case).
+            if top_k != 0 && out.len() >= top_k {
+                break;
+            }
+            let score = score as f32;
+            if let Some(min) = min_score {
+                if score < min {
+                    continue;
+                }
+            }
+            let Some(node) = self.db.get_node(node_id) else {
+                continue;
+            };
+            let module = node
+                .get_property("name")
+                .and_then(|v| v.as_str().map(String::from))
+                .unwrap_or_default();
+            let hit_design = node
+                .get_property("design")
+                .and_then(|v| v.as_str().map(String::from))
+                .unwrap_or_default();
+            if let Some(d) = design {
+                if hit_design != d {
+                    continue;
+                }
+            }
+            out.push(VectorHit {
+                module,
+                design: hit_design,
+                score,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Run a raw READ-ONLY openCypher query and return the rows as JSON.
+    ///
+    /// A last-resort escape hatch beside the typed query ops. Write clauses
+    /// (`CREATE`/`DELETE`/`SET`/`MERGE`/`REMOVE`/`DROP`/`DETACH`/`CALL`/…)
+    /// are rejected up front so the hatch can never mutate the graph. The
+    /// result is capped at `row_cap` rows; exceeding it returns a typed
+    /// `StoreError::Schema` "too broad" error rather than silently
+    /// truncating or exhausting memory. bender graphs are pruned-to-top so
+    /// a simple row cap suffices (no bounded-extract machinery needed).
+    pub fn run_readonly_cypher(
+        &self,
+        query: &str,
+        row_cap: usize,
+    ) -> Result<serde_json::Value> {
+        if let Some(kw) = first_write_keyword(query) {
+            return Err(StoreError::Schema(format!(
+                "read-only: write clause '{kw}' is not allowed in `kg query cypher`"
+            )));
+        }
+        // Bound execution, not just the returned rows: if the query has no
+        // explicit LIMIT, append `LIMIT row_cap + 1` so the engine stops
+        // materialising early instead of computing millions of rows we would
+        // then reject. `row_cap + 1` still lets us detect "too broad". If the
+        // user wrote their own LIMIT we respect it and only cap post-hoc.
+        let has_limit = query
+            .split(|c: char| !c.is_alphanumeric() && c != '_')
+            .any(|t| t.eq_ignore_ascii_case("LIMIT"));
+        let effective = if has_limit {
+            query.to_string()
+        } else {
+            format!("{} LIMIT {}", query.trim().trim_end_matches(';'), row_cap + 1)
+        };
+        let r = self.db.execute_cypher(&effective)?;
+        let rows = r.rows();
+        if rows.len() > row_cap {
+            return Err(StoreError::Schema(format!(
+                "query returned more than {row_cap} rows; narrow it (add a WHERE filter or LIMIT)"
+            )));
+        }
+        let columns = &r.columns;
+        let mut out_rows: Vec<serde_json::Value> = Vec::with_capacity(rows.len());
+        for row in rows {
+            let mut obj = serde_json::Map::new();
+            for (i, val) in row.iter().enumerate() {
+                let col = columns
+                    .get(i)
+                    .cloned()
+                    .unwrap_or_else(|| format!("col{i}"));
+                obj.insert(col, value_to_json(val));
+            }
+            out_rows.push(serde_json::Value::Object(obj));
+        }
+        Ok(serde_json::json!({
+            "columns": columns,
+            "row_count": out_rows.len(),
+            "rows": out_rows,
+        }))
+    }
+
     /// Drop the embedding properties for every module of `alias`. Cheap;
     /// `clear_design` already covers this when wiping a whole design.
     pub fn clear_embeddings_for_design(&self, alias: &str) -> Result<()> {
@@ -984,6 +1147,31 @@ fn module_key(design: &str, name: &str) -> String {
     format!("{design}::{name}")
 }
 
+/// Cypher clauses/procedures that can mutate the graph or escape read-only
+/// semantics. Matched case-insensitively as whole words so an identifier
+/// like `created_epoch` or a string literal fragment never trips the guard.
+const CYPHER_WRITE_KEYWORDS: &[&str] = &[
+    "CREATE", "DELETE", "DETACH", "SET", "MERGE", "REMOVE", "DROP", "CALL",
+    "FOREACH", "LOAD",
+];
+
+/// Return the first write keyword found in `query` (uppercased), or `None`
+/// if the query is read-only. Tokenizes on non-alphanumeric/underscore
+/// boundaries so only standalone keywords match.
+fn first_write_keyword(query: &str) -> Option<&'static str> {
+    for tok in query.split(|c: char| !c.is_alphanumeric() && c != '_') {
+        if tok.is_empty() {
+            continue;
+        }
+        for kw in CYPHER_WRITE_KEYWORDS {
+            if tok.eq_ignore_ascii_case(kw) {
+                return Some(kw);
+            }
+        }
+    }
+    None
+}
+
 // Build a single `Value::Map` row from `(key, value)` pairs. The map is
 // `Arc`'d once at the end so it ships as one heap allocation per row.
 fn row(entries: impl IntoIterator<Item = (&'static str, Value)>) -> Value {
@@ -1026,6 +1214,7 @@ fn merge_module_nodes_batch(
         let (pos_, poe) = m.port_block_lines.unwrap_or((-1, -1));
         let key = module_key(&m.design, &m.name);
         let (port_set_json, port_set_card) = build_port_set(&m.ports);
+        let searchable_text = build_searchable_text(m);
         rows.push(row([
             ("k", Value::from(key)),
             ("name", Value::from(m.name.as_str())),
@@ -1044,6 +1233,7 @@ fn merge_module_nodes_batch(
             ("ij", Value::from(imports_json)),
             ("psj", Value::from(port_set_json)),
             ("psc", Value::from(port_set_card)),
+            ("st", Value::from(searchable_text)),
         ]));
     }
     unwind_in_chunks(
@@ -1056,7 +1246,8 @@ fn merge_module_nodes_batch(
              m.port_block_start = r.ps, m.port_block_end = r.pe, \
              m.description = r.desc, \
              m.ports_json = r.pj, m.params_json = r.paj, m.imports_json = r.ij, \
-             m.port_set_json = r.psj, m.port_set_card = r.psc",
+             m.port_set_json = r.psj, m.port_set_card = r.psc, \
+             m.searchable_text = r.st",
         rows,
         chunk,
     )
@@ -1071,6 +1262,35 @@ fn build_port_set(ports: &[PortInfo]) -> (String, i64) {
     let card = set.len() as i64;
     let json = serde_json::to_string(&set.into_iter().collect::<Vec<_>>()).unwrap_or_default();
     (json, card)
+}
+
+/// Compose the broad keyword-search field indexed by BM25. Tracks
+/// `bender_kg_core::module_document` (the embedding input) so the keyword
+/// and vector arms of the hybrid search see the same tokens: module name,
+/// file path, parameter names, port names, and description. It additionally
+/// indexes port **type** strings (e.g. `axi_req_t`) — these are the tokens
+/// `find-by-protocol`-style keyword queries rely on, and RRF fusion is
+/// rank-based so the extra keyword signal cannot swamp the vector arm.
+fn build_searchable_text(m: &ModuleData) -> String {
+    let mut parts: Vec<&str> = vec![m.name.as_str()];
+    if !m.file_path.is_empty() {
+        parts.push(m.file_path.as_str());
+    }
+    for p in &m.parameters {
+        parts.push(p.name.as_str());
+    }
+    for p in &m.ports {
+        parts.push(p.name.as_str());
+        if !p.type_str.is_empty() {
+            parts.push(p.type_str.as_str());
+        }
+    }
+    if let Some(desc) = m.description.as_deref() {
+        if !desc.is_empty() {
+            parts.push(desc);
+        }
+    }
+    parts.join(" ")
 }
 
 // Pass 1b: MERGE every touched Design alias as a stub.
@@ -1234,12 +1454,99 @@ fn create_belongs_to_batch(session: &Session, modules: &[&ModuleData], chunk: us
     )
 }
 
+/// The compound identity of a `Port` node: `<design>::<module>.<port>`.
+fn port_key(design: &str, module: &str, port: &str) -> String {
+    format!("{design}::{module}.{port}")
+}
+
+// Pass 3: promote every port to a first-class `Port` node AND wire its
+// `HAS_PORT` edge from the parent Module — in ONE statement per row.
+//
+// A single `MATCH (m:Module {key})` + `MERGE (p:Port {key})` are both driven
+// by the `key` property index (O(1) each), and the edge is CREATEd between
+// the two already-bound endpoints. This deliberately avoids a comma-joined
+// two-pattern match like `MATCH (m {..}), (p {..})`: the planner only pushes
+// the `key` index into the FIRST pattern, full-scanning every node for the
+// second — which is ~10M scans for the 5.8k INSTANTIATES edges (tolerable)
+// but ~1.2B for the 34k HAS_PORT edges (minutes). Folding node + edge into
+// one indexed MATCH keeps this linear.
+//
+// CREATE (not MERGE) for the edge is safe and intentional: every upsert path
+// runs `clear_design` first (see `build::reset_design`), which DETACH DELETEs
+// the design's Port nodes and edges, so a rebuild starts clean. MERGE on the
+// edge would add an `edges_from(module)` scan per edge for no benefit.
+//
+// Port fields are the typed ones already on `PortInfo`; the `ports_json` blob
+// on the Module node is retained, so `get-module` / `get-ports` are unchanged.
+fn merge_port_nodes_batch(session: &Session, modules: &[&ModuleData], chunk: usize) -> Result<()> {
+    let mut rows: Vec<Value> = Vec::new();
+    for m in modules {
+        let module_k = module_key(&m.design, &m.name);
+        for p in &m.ports {
+            rows.push(row([
+                ("mk", Value::from(module_k.as_str())),
+                ("k", Value::from(port_key(&m.design, &m.name, &p.name))),
+                ("name", Value::from(p.name.as_str())),
+                ("d", Value::from(m.design.as_str())),
+                ("dir", Value::from(port::direction_str(p.direction))),
+                ("ts", Value::from(p.type_str.as_str())),
+                ("we", Value::from(p.width_expr.as_str())),
+                ("bw", Value::from(p.bit_width.unwrap_or(-1))),
+            ]));
+        }
+    }
+    unwind_in_chunks(
+        session,
+        "UNWIND $rows AS r \
+         MATCH (m:Module {key: r.mk}) \
+         MERGE (p:Port {key: r.k}) \
+         SET p.name = r.name, p.design = r.d, p.direction = r.dir, \
+             p.type_str = r.ts, p.width_expr = r.we, p.bit_width = r.bw \
+         CREATE (m)-[:HAS_PORT]->(p)",
+        rows,
+        chunk,
+    )
+}
+
 // =====================================================================
 // Row parsing
 // =====================================================================
 
 pub(crate) fn as_string(v: &Value) -> String {
     v.as_str().map(|s| s.to_string()).unwrap_or_default()
+}
+
+/// Convert a Grafeo `Value` into a clean `serde_json::Value` for the raw
+/// Cypher hatch. The derived `Serialize` on `Value` is externally tagged
+/// (`{"Int64": 5}`); this produces natural JSON (`5`) that an LLM can read.
+/// Exotic types (temporal, CRDT, vector, path) fall back to their `Display`
+/// string — good enough for an escape-hatch surface.
+fn value_to_json(v: &Value) -> serde_json::Value {
+    use serde_json::Value as J;
+    match v {
+        Value::Null => J::Null,
+        Value::Bool(b) => J::Bool(*b),
+        Value::Int64(i) => J::from(*i),
+        Value::Float64(f) => {
+            // JSON has no NaN/Infinity; preserve them as strings rather than
+            // silently collapsing to null (which reads as "missing").
+            if f.is_nan() {
+                J::String("NaN".to_string())
+            } else if f.is_infinite() {
+                J::String(if f.is_sign_positive() { "Infinity" } else { "-Infinity" }.to_string())
+            } else {
+                serde_json::Number::from_f64(*f).map(J::Number).unwrap_or(J::Null)
+            }
+        }
+        Value::String(s) => J::String(s.to_string()),
+        Value::List(items) => J::Array(items.iter().map(value_to_json).collect()),
+        Value::Map(map) => J::Object(
+            map.iter()
+                .map(|(k, val)| (k.as_str().to_string(), value_to_json(val)))
+                .collect(),
+        ),
+        other => J::String(other.to_string()),
+    }
 }
 
 fn as_bool_opt(v: &Value) -> Option<bool> {
@@ -1533,6 +1840,105 @@ mod tests {
         store.clear_design("d1")?;
         assert_eq!(store.stats(Some("d1"))?.modules, 0);
         assert_eq!(store.stats(Some("d2"))?.modules, 1);
+        Ok(())
+    }
+
+    /// Ports are promoted to first-class `Port` nodes with `HAS_PORT`
+    /// edges, discoverable via Cypher; `find_by_protocol` uses that path;
+    /// and `clear_design` removes the Port nodes too (no orphans).
+    #[test]
+    fn ports_as_nodes_and_has_port_edges() -> Result<()> {
+        let tmp = tempdir().unwrap();
+        let cfg = StoreConfig::new(tmp.path());
+        let store = Store::open(&cfg)?;
+        let mut m = make_module("axi_thing", "d1");
+        m.ports.push(PortInfo {
+            name: "clk".into(),
+            direction: Direction::Input,
+            type_str: "logic".into(),
+            ..Default::default()
+        });
+        m.ports.push(PortInfo {
+            name: "axi_req".into(),
+            direction: Direction::Input,
+            type_str: "axi_req_t".into(),
+            ..Default::default()
+        });
+        store.register_design("d1", "ID1", None, None, &["rtl".to_string()], &[])?;
+        store.upsert_module(&m)?;
+
+        // HAS_PORT edges reachable from the module.
+        let r = store.db.execute_cypher_with_params(
+            "MATCH (m:Module {name: $n})-[:HAS_PORT]->(p:Port) RETURN p.name, p.direction, p.type_str",
+            cparam("n", "axi_thing"),
+        )?;
+        let mut names: Vec<String> = r.rows().iter().map(|row| as_string(&row[0])).collect();
+        names.sort();
+        assert_eq!(names, vec!["axi_req".to_string(), "clk".to_string()]);
+
+        // Rebuild path (clear_design + upsert, as `build::reset_design`
+        // does) must yield exactly the same ports — no orphans, no dupes.
+        store.clear_design("d1")?;
+        store.upsert_module(&m)?;
+        let r = store.db.execute_cypher_with_params(
+            "MATCH (m:Module {name: $n})-[:HAS_PORT]->(p:Port) RETURN count(p)",
+            cparam("n", "axi_thing"),
+        )?;
+        assert_eq!(r.rows()[0][0].as_int64().unwrap_or(-1), 2, "rebuild: exactly 2 HAS_PORT edges");
+        let r = store.db.execute_cypher("MATCH (p:Port) RETURN count(p)")?;
+        assert_eq!(r.rows()[0][0].as_int64().unwrap_or(-1), 2, "rebuild: exactly 2 Port nodes");
+
+        // find_by_protocol via the node path matches only the typed port.
+        let hits = store.find_by_protocol("axi", None)?;
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].name, "axi_thing");
+
+        // clear_design removes the Port nodes too.
+        store.clear_design("d1")?;
+        let r = store
+            .db
+            .execute_cypher("MATCH (p:Port) RETURN count(p)")?;
+        assert_eq!(r.rows()[0][0].as_int64().unwrap_or(-1), 0);
+        Ok(())
+    }
+
+    /// The raw-Cypher escape hatch: reads return rows, write clauses are
+    /// rejected, and over-cap results return a typed error.
+    #[test]
+    fn readonly_cypher_reads_rejects_writes_and_caps() -> Result<()> {
+        let tmp = tempdir().unwrap();
+        let cfg = StoreConfig::new(tmp.path());
+        let store = Store::open(&cfg)?;
+        store.register_design("d1", "ID1", None, None, &[], &[])?;
+        store.upsert_module(&make_module("alpha", "d1"))?;
+        store.upsert_module(&make_module("beta", "d1"))?;
+
+        // Read works.
+        let v = store.run_readonly_cypher("MATCH (m:Module) RETURN m.name", 1000)?;
+        assert_eq!(v["row_count"].as_u64(), Some(2));
+
+        // Write clauses are rejected (case-insensitive, whole-word).
+        for q in [
+            "MATCH (m:Module) DELETE m",
+            "CREATE (m:Module {name: 'x'})",
+            "MATCH (m:Module) SET m.name = 'x'",
+            "MERGE (m:Module {name: 'x'})",
+        ] {
+            assert!(
+                store.run_readonly_cypher(q, 1000).is_err(),
+                "should reject: {q}"
+            );
+        }
+
+        // A property named with an embedded keyword must NOT trip the guard.
+        assert!(
+            store
+                .run_readonly_cypher("MATCH (m:Module) RETURN m.created_epoch", 1000)
+                .is_ok()
+        );
+
+        // Over-cap returns a typed error.
+        assert!(store.run_readonly_cypher("MATCH (m:Module) RETURN m.name", 1).is_err());
         Ok(())
     }
 

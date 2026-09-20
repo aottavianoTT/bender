@@ -17,6 +17,29 @@ impl Engine {
         let m = self
             .get_module(module_name)?
             .ok_or_else(|| CoreError::NotFound(module_name.into()))?;
+        // One-shot retrieval: return module body + ports + params (+ named
+        // instance, if given) in a single call, collapsing the common
+        // three-round-trip pattern. Each sub-element reuses the same
+        // single-element path so line-range/error semantics stay identical.
+        if element == "all" {
+            let mut sub = vec!["module", "ports", "params"];
+            if !instance_name.is_empty() {
+                sub.push("instance");
+            }
+            let mut elements = serde_json::Map::new();
+            for el in sub {
+                elements.insert(
+                    el.to_string(),
+                    self.get_source_snippet(module_name, el, instance_name)?,
+                );
+            }
+            return Ok(serde_json::json!({
+                "module_name": module_name,
+                "file_path": m.file_path,
+                "element": "all",
+                "elements": elements,
+            }));
+        }
         let (start, end): (Option<i64>, Option<i64>) = match element {
             "module" => (m.line_start, m.line_end),
             "ports" => match m.port_block_lines {
@@ -47,7 +70,7 @@ impl Engine {
             _ => {
                 return Ok(serde_json::json!({
                     "error": format!(
-                        "unknown element '{}'. Use: module, ports, params, instance",
+                        "unknown element '{}'. Use: module, ports, params, instance, all",
                         element
                     ),
                 }));
