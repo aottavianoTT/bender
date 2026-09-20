@@ -142,8 +142,7 @@ std::string parent_module_name(const InstanceSymbol& inst) {
     return {};
 }
 
-struct ElabVisitor : public ASTVisitor<ElabVisitor, /*VisitStatements=*/false,
-                                        /*VisitExpressions=*/false> {
+struct ElabVisitor : public ASTVisitor<ElabVisitor> {
     KgElabResult& out;
     explicit ElabVisitor(KgElabResult& o) : out(o) {}
 

@@ -405,7 +405,7 @@ fn resolve_inputs(
     let srcs = srcs
         .filter_targets(&targets)
         .unwrap_or_default()
-        .filter_packages(&packages)
+        .filter_packages(&packages, true)
         .unwrap_or_default();
 
     let srcs_flat = srcs
